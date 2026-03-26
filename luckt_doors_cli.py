@@ -17,6 +17,13 @@ getcontext().prec = 2000
 RISK_SCHEDULE = [5, 10, 15, 20, 25, 35, 50]
 START_AMOUNT_CENTS = 1
 SAVE_FILE = "lucky_doors_save.json"
+LUCKY_EVENT_CHANCE = 0.12
+
+DIFFICULTIES = {
+    "casual": {"risk_shift": -5, "reward_factor": Decimal("2.20"), "label": "Casual"},
+    "standard": {"risk_shift": 0, "reward_factor": Decimal("2.00"), "label": "Standard"},
+    "hardcore": {"risk_shift": 8, "reward_factor": Decimal("2.60"), "label": "Hardcore"},
+}
 
 
 class Color:
@@ -52,6 +59,13 @@ class Milestone:
     description: str
 
 
+@dataclass
+class LuckyEvent:
+    title: str
+    description: str
+    bonus_cents: int
+
+
 class LuckyDoorsCLI:
     def __init__(self) -> None:
         init(autoreset=True)
@@ -66,7 +80,8 @@ class LuckyDoorsCLI:
         os.system("cls" if os.name == "nt" else "clear")
 
     def wait(self, seconds: float) -> None:
-        time.sleep(seconds)
+        if self.get_setting("animations", True):
+            time.sleep(seconds)
 
     def pause(self, message: str = "Press Enter to continue...") -> None:
         input(self.color_text(message, Color.DIM))
@@ -75,7 +90,7 @@ class LuckyDoorsCLI:
         return "".join(styles) + text + Color.RESET
 
     def divider(self, char: str = "=") -> str:
-        return self.color_text(char * 78, Color.DIM)
+        return self.color_text(char * 82, Color.DIM)
 
     # ------------------------------------------------------------------
     # Save data and upgrades
@@ -87,12 +102,20 @@ class LuckyDoorsCLI:
                 "start_amount": 0,
                 "risk_shield": 0,
                 "cash_bonus": 0,
+                "revive_token": 0,
+            },
+            "settings": {
+                "animations": True,
             },
             "stats": {
                 "runs_played": 0,
                 "best_run_cents": START_AMOUNT_CENTS,
                 "best_door": 1,
                 "total_cashed_out_cents": 0,
+                "classic_wins": 0,
+                "classic_losses": 0,
+                "classic_cashouts": 0,
+                "best_win_streak": 0,
                 "bet_wins": 0,
                 "bet_losses": 0,
                 "total_bet_staked_cents": 0,
@@ -147,6 +170,10 @@ class LuckyDoorsCLI:
         level = self.get_upgrade_level("cash_bonus")
         return 75 * (4 ** level)
 
+    def get_revive_upgrade_cost(self) -> int:
+        level = self.get_upgrade_level("revive_token")
+        return 250 * (3 ** level)
+
     def get_start_amount_cents(self) -> int:
         level = self.get_upgrade_level("start_amount")
         return START_AMOUNT_CENTS * (2 ** level)
@@ -155,15 +182,22 @@ class LuckyDoorsCLI:
         level = self.get_upgrade_level("cash_bonus")
         return level * 10
 
+    def get_setting(self, key: str, default: bool = True) -> bool:
+        return bool(self.save_data.get("settings", {}).get(key, default))
+
     # ------------------------------------------------------------------
     # Run state
     # ------------------------------------------------------------------
     def reset_run(self) -> None:
         self.door = 1
+        self.difficulty_key = "standard"
         self.current_cents = self.get_start_amount_cents()
         self.peak_cents = self.current_cents
+        self.current_streak = 0
+        self.revive_used = False
         self.history: List[HistoryEntry] = []
         self.milestones: List[Milestone] = []
+        self.run_events: List[LuckyEvent] = []
         self.unlocked_milestones: set[str] = set()
         self.highest_round_threshold_cents = 0
         self.fifty_unlocked = False
@@ -176,10 +210,14 @@ class LuckyDoorsCLI:
     def get_effective_risk_percent(self, door: int) -> int:
         base_risk = self.get_base_risk_percent(door)
         shield = self.get_upgrade_level("risk_shield")
-        return max(1, base_risk - shield)
+        difficulty_shift = int(DIFFICULTIES[self.difficulty_key]["risk_shift"])
+        return min(90, max(1, base_risk - shield + difficulty_shift))
 
     def next_reward_cents(self) -> int:
-        return self.current_cents * 2
+        reward = (Decimal(self.current_cents) * DIFFICULTIES[self.difficulty_key]["reward_factor"]).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+        return int(reward)
 
     # ------------------------------------------------------------------
     # Formatting
@@ -234,7 +272,18 @@ class LuckyDoorsCLI:
             f"Start Amount Lv.{self.get_upgrade_level('start_amount')} -> start run with {self.format_money(self.get_start_amount_cents())}",
             f"Risk Shield  Lv.{self.get_upgrade_level('risk_shield')} -> -{self.get_upgrade_level('risk_shield')}% permanent risk",
             f"Cash Bonus   Lv.{self.get_upgrade_level('cash_bonus')} -> +{self.get_cash_bonus_percent()}% bank bonus on cash out",
+            f"Revive Token Lv.{self.get_upgrade_level('revive_token')} -> {self.get_upgrade_level('revive_token')} one-time save(s) per run",
         ]
+
+    def render_risk_bar(self, risk: int) -> str:
+        filled = min(20, max(1, round((risk / 100) * 20)))
+        return f"[{'#' * filled}{'.' * (20 - filled)}] {risk:>2}%"
+
+    def render_doors(self) -> None:
+        print(self.color_text("┌────────┐  ┌────────┐  ┌────────┐", Color.DIM))
+        print(self.color_text("│  DOOR  │  │  DOOR  │  │  DOOR  │", Color.DIM))
+        print(self.color_text("│   1    │  │   2    │  │   3    │", Color.DIM))
+        print(self.color_text("└────────┘  └────────┘  └────────┘", Color.DIM))
 
     # ------------------------------------------------------------------
     # Bet mode helpers
@@ -296,8 +345,7 @@ class LuckyDoorsCLI:
         if milestone_id in self.unlocked_milestones:
             return
 
-        self.unlocked_milestones.add(milestones_id := milestone_id)
-        _ = milestones_id
+        self.unlocked_milestones.add(milestone_id)
         self.milestones.append(Milestone(title=title, description=description))
 
         print()
@@ -316,7 +364,7 @@ class LuckyDoorsCLI:
             self.add_milestone(
                 "fifty-percent",
                 "50% risk reached",
-                "From here on, every risky door is a true 50/50 coin flip.",
+                "From here on, every risky door is a true coin flip.",
             )
 
         threshold = 1000  # $10.00 in cents
@@ -333,6 +381,25 @@ class LuckyDoorsCLI:
                 f"Your current stack just pushed past {label}.",
             )
 
+    def maybe_trigger_lucky_event(self) -> None:
+        if random.random() > LUCKY_EVENT_CHANCE:
+            return
+
+        bonus = max(1, self.current_cents // 5)
+        self.current_cents += bonus
+        self.peak_cents = max(self.peak_cents, self.current_cents)
+        event = LuckyEvent(
+            title="Lucky Echo",
+            description="A hidden vault clicked open and boosted your stack.",
+            bonus_cents=bonus,
+        )
+        self.run_events.append(event)
+
+        print(self.color_text("\nLUCKY EVENT!", Color.BOLD, Color.MAGENTA))
+        print(self.color_text(event.title, Color.BOLD, Color.WHITE))
+        print(self.color_text(event.description, Color.CYAN))
+        print(self.color_text(f"Bonus gained: +{self.format_money(bonus)}", Color.GREEN))
+
     # ------------------------------------------------------------------
     # Screens
     # ------------------------------------------------------------------
@@ -340,7 +407,7 @@ class LuckyDoorsCLI:
         self.clear_screen()
         print(self.divider("#"))
         print(self.color_text("LUCKY DOORS - CLI EDITION", Color.BOLD, Color.YELLOW))
-        print(self.color_text("Classic mode + new Bet mode.", Color.WHITE))
+        print(self.color_text("Classic mode + Bet mode + difficulty, streaks, and revives.", Color.WHITE))
         print(self.divider("#"))
         print()
         print(self.color_text(f"Persistent bank: {self.format_money(self.save_data['bank_cents'])}", Color.BOLD, Color.GREEN))
@@ -356,6 +423,7 @@ class LuckyDoorsCLI:
         print(self.color_text("[B] Bet mode", Color.MAGENTA))
         print(self.color_text("[S] Shop / upgrades", Color.YELLOW))
         print(self.color_text("[T] Lifetime stats", Color.CYAN))
+        print(self.color_text("[O] Options", Color.WHITE))
         print(self.color_text("[Q] Quit", Color.RED))
         print(self.divider("-"))
 
@@ -371,11 +439,16 @@ class LuckyDoorsCLI:
         print(self.color_text(f"Current amount      : {self.format_money(self.current_cents)}", Color.BOLD, Color.GREEN))
         print(self.color_text(f"Next reward         : {self.format_money(self.next_reward_cents())}", Color.WHITE))
         print(self.color_text(f"Current risk        : {risk}%", Color.RED if risk >= 25 else Color.YELLOW))
+        print(self.color_text(f"Risk meter          : {self.render_risk_bar(risk)}", Color.RED if risk >= 25 else Color.YELLOW))
         print(self.color_text(f"Base risk           : {base_risk}%", Color.DIM))
+        print(self.color_text(f"Difficulty          : {DIFFICULTIES[self.difficulty_key]['label']}", Color.CYAN))
+        print(self.color_text(f"Win streak          : {self.current_streak}", Color.YELLOW))
         print(self.color_text(f"Bank                : {self.format_money(self.save_data['bank_cents'])}", Color.CYAN))
-        print(self.color_text(f"Cash-out bonus      : +{bonus_percent}%", Color.MAGENTA))
+        print(self.color_text(f"Cash-out bonus      : +{bonus_percent}% + streak bonus", Color.MAGENTA))
+        print(self.color_text(f"Revive tokens       : {self.get_upgrade_level('revive_token')}", Color.WHITE))
         print(self.color_text(f"Peak this run       : {self.format_money(self.peak_cents)}", Color.WHITE))
         print(self.color_text(f"Mood                : {self.risk_flavor(risk)}", Color.DIM))
+        self.render_doors()
         print(self.divider("-"))
 
     def print_recent_history(self, max_entries: int = 8) -> None:
@@ -417,9 +490,20 @@ class LuckyDoorsCLI:
 
         print()
 
+    def print_recent_events(self) -> None:
+        print(self.color_text("Lucky events", Color.BOLD, Color.BLUE))
+        if not self.run_events:
+            print(self.color_text("  No lucky events this run.", Color.DIM))
+            print()
+            return
+
+        for event in self.run_events[-3:]:
+            print(self.color_text(f"  - {event.title}: +{self.format_money(event.bonus_cents)}", Color.GREEN))
+        print()
+
     def print_run_menu(self) -> None:
         print(self.divider("-"))
-        print(self.color_text("[R] Risk it  -> double or lose all", Color.RED))
+        print(self.color_text("[R] Risk it  -> scaled reward or lose all", Color.RED))
         print(self.color_text("[C] Cash out -> secure current amount into your bank", Color.GREEN))
         print(self.color_text("[H] Full history", Color.CYAN))
         print(self.color_text("[M] Full milestones", Color.MAGENTA))
@@ -456,6 +540,12 @@ class LuckyDoorsCLI:
         print(f"    Cost  : {self.format_money(self.get_cash_bonus_upgrade_cost())}")
         print()
 
+        print(self.color_text("[4] Revive Token", Color.CYAN))
+        print(f"    Level : {self.get_upgrade_level('revive_token')}")
+        print("    Effect: Each level grants one one-time automatic second chance per run")
+        print(f"    Cost  : {self.format_money(self.get_revive_upgrade_cost())}")
+        print()
+
         print(self.divider("-"))
         print(self.color_text("[B] Back", Color.YELLOW))
         print(self.divider("-"))
@@ -470,6 +560,10 @@ class LuckyDoorsCLI:
         print(self.color_text(f"Best amount reached    : {self.format_money(stats['best_run_cents'])}", Color.GREEN))
         print(self.color_text(f"Deepest door reached   : #{stats['best_door']}", Color.CYAN))
         print(self.color_text(f"Total cashed out ever  : {self.format_money(stats['total_cashed_out_cents'])}", Color.MAGENTA))
+        print(self.color_text(f"Classic wins           : {stats['classic_wins']}", Color.GREEN))
+        print(self.color_text(f"Classic losses         : {stats['classic_losses']}", Color.RED))
+        print(self.color_text(f"Classic cashouts       : {stats['classic_cashouts']}", Color.YELLOW))
+        print(self.color_text(f"Best win streak        : {stats['best_win_streak']}", Color.CYAN))
         print(self.color_text(f"Bet wins               : {stats['bet_wins']}", Color.GREEN))
         print(self.color_text(f"Bet losses             : {stats['bet_losses']}", Color.RED))
         print(self.color_text(f"Total bet staked       : {self.format_money(stats['total_bet_staked_cents'])}", Color.WHITE))
@@ -558,9 +652,9 @@ class LuckyDoorsCLI:
     def prompt_main_menu_choice(self) -> str:
         while True:
             choice = input(self.color_text("> ", Color.BOLD)).strip().lower()
-            if choice in {"p", "b", "s", "t", "q"}:
+            if choice in {"p", "b", "s", "t", "o", "q"}:
                 return choice
-            print(self.color_text("Invalid choice. Type p, b, s, t, or q.", Color.RED))
+            print(self.color_text("Invalid choice. Type p, b, s, t, o, or q.", Color.RED))
 
     def prompt_run_choice(self) -> str:
         while True:
@@ -572,9 +666,32 @@ class LuckyDoorsCLI:
     def prompt_shop_choice(self) -> str:
         while True:
             choice = input(self.color_text("> ", Color.BOLD)).strip().lower()
-            if choice in {"1", "2", "3", "b"}:
+            if choice in {"1", "2", "3", "4", "b"}:
                 return choice
-            print(self.color_text("Invalid choice. Type 1, 2, 3, or b.", Color.RED))
+            print(self.color_text("Invalid choice. Type 1, 2, 3, 4, or b.", Color.RED))
+
+    def prompt_difficulty_choice(self) -> str | None:
+        while True:
+            self.clear_screen()
+            print(self.divider("#"))
+            print(self.color_text("SELECT DIFFICULTY", Color.BOLD, Color.YELLOW))
+            print(self.divider("#"))
+            print(self.color_text("[1] Casual   : lower risk, lower reward", Color.GREEN))
+            print(self.color_text("[2] Standard : balanced", Color.WHITE))
+            print(self.color_text("[3] Hardcore : higher risk, bigger reward", Color.RED))
+            print(self.color_text("[B] Back", Color.YELLOW))
+            print(self.divider("-"))
+            choice = input(self.color_text("> ", Color.BOLD)).strip().lower()
+            if choice == "1":
+                return "casual"
+            if choice == "2":
+                return "standard"
+            if choice == "3":
+                return "hardcore"
+            if choice == "b":
+                return None
+            print(self.color_text("Invalid choice.", Color.RED))
+            self.wait(0.6)
 
     def prompt_bet_amount(self) -> int | None:
         bank_cents = self.save_data["bank_cents"]
@@ -634,8 +751,10 @@ class LuckyDoorsCLI:
             message = f"Purchased Start Amount. New start: {self.format_money(self.get_start_amount_cents())}"
         elif name == "risk_shield":
             message = f"Purchased Risk Shield. New reduction: -{self.get_upgrade_level('risk_shield')}%"
-        else:
+        elif name == "cash_bonus":
             message = f"Purchased Cash Bonus. New cash-out bonus: +{self.get_cash_bonus_percent()}%"
+        else:
+            message = "Purchased Revive Token. You now get more second chances per run."
 
         print(self.color_text(message, Color.GREEN, Color.BOLD))
         self.pause()
@@ -651,6 +770,25 @@ class LuckyDoorsCLI:
                 self.buy_upgrade("risk_shield", self.get_risk_shield_upgrade_cost())
             elif choice == "3":
                 self.buy_upgrade("cash_bonus", self.get_cash_bonus_upgrade_cost())
+            elif choice == "4":
+                self.buy_upgrade("revive_token", self.get_revive_upgrade_cost())
+            elif choice == "b":
+                return
+
+    def options_loop(self) -> None:
+        while True:
+            self.clear_screen()
+            animations = self.get_setting("animations", True)
+            print(self.divider("#"))
+            print(self.color_text("OPTIONS", Color.BOLD, Color.YELLOW))
+            print(self.divider("#"))
+            print(self.color_text(f"[1] Toggle animations : {'ON' if animations else 'OFF'}", Color.CYAN))
+            print(self.color_text("[B] Back", Color.YELLOW))
+            print(self.divider("-"))
+            choice = input(self.color_text("> ", Color.BOLD)).strip().lower()
+            if choice == "1":
+                self.save_data["settings"]["animations"] = not animations
+                self.save_game()
             elif choice == "b":
                 return
 
@@ -666,7 +804,7 @@ class LuckyDoorsCLI:
 
         for line in lines:
             print(line)
-            self.wait(0.55)
+            self.wait(0.45)
 
     def update_lifetime_peak_stats(self) -> None:
         stats = self.save_data["stats"]
@@ -677,54 +815,76 @@ class LuckyDoorsCLI:
     def risk_it(self) -> bool:
         risk = self.get_effective_risk_percent(self.door)
         before = self.current_cents
-        after = before * 2
+        after = self.next_reward_cents()
 
         print()
         self.suspense()
         lost = random.random() < (risk / 100)
 
         if lost:
+            revive_pool = self.get_upgrade_level("revive_token")
+            if revive_pool > 0 and not self.revive_used:
+                self.save_data["upgrades"]["revive_token"] -= 1
+                self.revive_used = True
+                self.current_cents = max(1, before // 2)
+                self.add_history_entry("win", before, self.current_cents)
+                self.save_game()
+                print(self.color_text("REVIVE TOKEN TRIGGERED! You survived with half your stack.", Color.BOLD, Color.MAGENTA))
+                self.pause()
+                return True
+
             self.add_history_entry("lose", before, 0)
+            self.save_data["stats"]["classic_losses"] += 1
+            self.current_streak = 0
             self.print_lose_screen(before)
             self.update_lifetime_peak_stats()
+            self.save_game()
             self.pause()
             return False
 
         self.current_cents = after
         self.peak_cents = max(self.peak_cents, self.current_cents)
         self.add_history_entry("win", before, after)
+        self.current_streak += 1
+        self.save_data["stats"]["classic_wins"] += 1
+        self.save_data["stats"]["best_win_streak"] = max(self.save_data["stats"]["best_win_streak"], self.current_streak)
         self.door += 1
         self.check_milestones()
+        self.maybe_trigger_lucky_event()
         self.update_lifetime_peak_stats()
 
         print()
         print(self.color_text("*** WIN ***", Color.BOLD, Color.GREEN))
-        print(self.color_text(f"You doubled up to {self.format_money(self.current_cents)}.", Color.GREEN))
+        print(self.color_text(f"You climbed up to {self.format_money(self.current_cents)}.", Color.GREEN))
         self.pause()
         return True
 
     def cash_out(self) -> None:
         before = self.current_cents
         bonus_percent = self.get_cash_bonus_percent()
-        bonus_cents = (before * bonus_percent) // 100
+        streak_bonus_percent = min(30, self.current_streak * 2)
+        total_bonus_percent = bonus_percent + streak_bonus_percent
+        bonus_cents = (before * total_bonus_percent) // 100
         payout_cents = before + bonus_cents
 
         self.add_history_entry("cash", before, payout_cents)
         self.save_data["bank_cents"] += payout_cents
         self.save_data["stats"]["total_cashed_out_cents"] += payout_cents
+        self.save_data["stats"]["classic_cashouts"] += 1
         self.update_lifetime_peak_stats()
         self.save_game()
 
-        self.print_cashout_screen(before, bonus_cents, payout_cents)
+        self.print_cashout_screen(before, bonus_cents, payout_cents, streak_bonus_percent)
         self.pause()
 
-    def print_cashout_screen(self, run_amount_cents: int, bonus_cents: int, payout_cents: int) -> None:
+    def print_cashout_screen(self, run_amount_cents: int, bonus_cents: int, payout_cents: int, streak_bonus_percent: int) -> None:
         self.clear_screen()
         print(self.divider("="))
         print(self.color_text("CASHED OUT", Color.BOLD, Color.GREEN))
         print(self.divider("="))
         print(self.color_text(f"Run winnings      : {self.format_money(run_amount_cents)}", Color.WHITE))
         print(self.color_text(f"Cash-out bonus    : {self.format_money(bonus_cents)}", Color.MAGENTA))
+        print(self.color_text(f"Streak bonus rate : +{streak_bonus_percent}%", Color.YELLOW))
         print(self.color_text(f"Added to bank     : {self.format_money(payout_cents)}", Color.BOLD, Color.GREEN))
         print(self.color_text(f"Bank total        : {self.format_money(self.save_data['bank_cents'])}", Color.BOLD, Color.CYAN))
         print(self.color_text(f"Door reached      : #{self.door}", Color.YELLOW))
@@ -744,6 +904,11 @@ class LuckyDoorsCLI:
 
     def run_loop(self) -> None:
         self.reset_run()
+        difficulty = self.prompt_difficulty_choice()
+        if difficulty is None:
+            return
+
+        self.difficulty_key = difficulty
         self.save_data["stats"]["runs_played"] += 1
         self.save_game()
         self.in_run = True
@@ -752,6 +917,7 @@ class LuckyDoorsCLI:
             self.print_status()
             self.print_recent_history()
             self.print_recent_milestones()
+            self.print_recent_events()
             self.print_run_menu()
             choice = self.prompt_run_choice()
 
@@ -886,6 +1052,8 @@ class LuckyDoorsCLI:
                 self.shop_loop()
             elif choice == "t":
                 self.print_lifetime_stats()
+            elif choice == "o":
+                self.options_loop()
             elif choice == "q":
                 self.clear_screen()
                 print(self.color_text("Goodbye.", Color.BOLD, Color.YELLOW))
